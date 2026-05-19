@@ -11,7 +11,7 @@ It detects sample numbers from `bloodSampleId` using the pattern after `IS-`, fo
 
 `APT-160425D02-IS-1` -> sample number `1`
 
-## What it computes:
+## Computations:
 
 For each selected condition × analyte × device:
 
@@ -20,7 +20,7 @@ For each selected condition × analyte × device:
 - Robust MAD-based SD/CV
 - Shapiro-Wilk normality test on within-sample residuals
 - Classic Levene homogeneity test using mean-centering
-- Brown-Forsythe homogeneity test using median-centering, which is more robust
+- Brown-Forsythe homogeneity test using median-centering, may be more robust
 - Optional 95% bootstrap confidence intervals
 - Outlier log with batch ID, sample ID, device, analyte, and value
 
@@ -41,7 +41,7 @@ The downloaded diagnostics file includes:
 - `brown_forsythe_median_p`
 - `brown_forsythe_homogeneity_check`
 
-A p-value below 0.05 is marked as a failure of that assumption check, but the app still reports robust MAD CV and bootstrap CI so the analysis does not depend only on normality/homogeneity assumptions.
+A p-value below 0.05 is marked as a failure of that assumption check, but the app still reports robust MAD CV and bootstrap CI so the analysis does not depend only on normality/homogeneity assumptions. The user can customize to their data context and data patterns. 
 
 ## Downloads
 
@@ -67,15 +67,6 @@ Or:
 python run_app.py
 ```
 
-## Deploy on Streamlit Community Cloud
-
-1. Create a GitHub repository.
-2. Upload `app.py`, `run_app.py`, `requirements.txt`, and this `README.md`.
-3. Go to Streamlit Community Cloud.
-4. Click "New app".
-5. Select your repository.
-6. Set the main file path to `app.py`.
-7. Deploy.
 
 ## ZIP outputs
 
