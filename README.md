@@ -1,5 +1,7 @@
 # Imprecision Short Repeatability App — updated
 
+https://imprecision-short.streamlit.app/
+
 Key UI/output updates only; the existing short-term statistical pipeline is retained.
 
 - Global-flag column selector added under ID-column confirmation.
