@@ -43,6 +43,8 @@ class AnalysisConfig:
     batch_col: str
     sample_col: str
     device_col: str
+    global_flag_col: Optional[str]
+    treat_all_global_false: bool
     condition_map: Dict[str, List[str]]
     analytes: List[str]
     devices: List[str]
@@ -231,6 +233,71 @@ def flag_outliers_one_group(
         remaining.remove(chosen_idx)
 
     return flags.fillna(False), logs
+
+def normalize_bool(value) -> bool:
+    """Conservative parser for typical exported TRUE/FALSE flag values."""
+    if pd.isna(value):
+        return False
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value):
+        return bool(int(value))
+    text = str(value).strip().lower()
+    return text in {"true", "t", "1", "yes", "y", "flagged"}
+
+
+def split_global_flag_rows(df: pd.DataFrame, cfg: AnalysisConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Exclude global_flag=TRUE before statistical analysis and retain a separate audit."""
+    if cfg.treat_all_global_false or not cfg.global_flag_col or cfg.global_flag_col == "None":
+        return df.copy(), pd.DataFrame()
+    if cfg.global_flag_col not in df.columns:
+        raise ValueError(f"Selected global flag column '{cfg.global_flag_col}' was not found.")
+
+    mask = df[cfg.global_flag_col].map(normalize_bool).fillna(False).astype(bool)
+    excluded = df.loc[mask].copy()
+    eligible = df.loc[~mask].copy()
+
+    sample_to_condition = {}
+    for condition, sample_list in cfg.condition_map.items():
+        for sample in sample_list:
+            sample_to_condition[str(sample)] = condition
+
+    rows = []
+    for _, row in excluded.iterrows():
+        sample_number = str(extract_sample_number(row.get(cfg.sample_col, "")))
+        condition = sample_to_condition.get(sample_number, "")
+        device = str(row.get(cfg.device_col, ""))
+        batch = str(row.get(cfg.batch_col, ""))
+        sample_id = row.get(cfg.sample_col, "")
+        for analyte in cfg.analytes:
+            if analyte not in excluded.columns or pd.isna(row.get(analyte, np.nan)):
+                continue
+            rows.append({
+                "condition": condition,
+                "device": device,
+                "sample_number": sample_number,
+                "analyte": analyte,
+                "batch_id": batch,
+                "bloodSampleId": sample_id,
+                "deviceId": device,
+                "value": row.get(analyte, np.nan),
+                "normality_status_raw": "",
+                "shapiro_wilk_p_residuals_raw": np.nan,
+                "outlier_method": "global_flag=TRUE exclusion",
+                "removed_order": np.nan,
+                "direction": "",
+                "outlier_metric": np.nan,
+                "outlier_threshold": np.nan,
+                "details": f"Excluded before statistical analysis because {cfg.global_flag_col}=TRUE",
+                "gcrit_mode": "",
+                "manual_gcrit": np.nan,
+                "gcrit_alpha": np.nan,
+                "gcrit_tail": "",
+                "mad_zcrit": np.nan,
+                "robust_interval_z": np.nan,
+            })
+    return eligible, pd.DataFrame(rows)
+
 
 def make_long_working_df(df: pd.DataFrame, cfg: AnalysisConfig) -> pd.DataFrame:
     work = df.copy()
@@ -872,10 +939,9 @@ def make_excel_output(
     outlier_log: pd.DataFrame,
     cfg: AnalysisConfig,
     decisions: pd.DataFrame,
+    global_flag_log: pd.DataFrame,
 ) -> bytes:
-    """Return ONE combined Excel workbook with exactly three sheets:
-    summary_raw_cleaned, outliers, settings.
-    """
+    """Return ONE combined Excel workbook with separate statistical-outlier and global-flag audits."""
     excel_buf = io.BytesIO()
     with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
         final_summary.to_excel(writer, sheet_name="summary_raw_cleaned", index=False)
@@ -893,6 +959,20 @@ def make_excel_output(
         else:
             outlier_log.to_excel(writer, sheet_name="outliers", index=False)
 
+        # Keep global quality-control exclusions separate from statistical outliers.
+        if global_flag_log is None or global_flag_log.empty:
+            template_cols = list(outlier_log.columns) if outlier_log is not None and len(outlier_log.columns) else [
+                "condition", "device", "sample_number", "analyte", "batch_id",
+                "bloodSampleId", "deviceId", "value", "normality_status_raw",
+                "shapiro_wilk_p_residuals_raw", "outlier_method", "removed_order",
+                "direction", "outlier_metric", "outlier_threshold", "details",
+                "gcrit_mode", "manual_gcrit", "gcrit_alpha", "gcrit_tail",
+                "mad_zcrit", "robust_interval_z",
+            ]
+            pd.DataFrame(columns=template_cols).to_excel(writer, sheet_name="global flag TRUE", index=False)
+        else:
+            global_flag_log.to_excel(writer, sheet_name="global flag TRUE", index=False)
+
         auto_note = (
             "Shapiro-Wilk on RAW pooled sample x device residuals for each condition/analyte; "
             "p >= 0.05 uses Gcrit, p < 0.05 uses Robust MAD; unavailable Shapiro uses Robust MAD fallback."
@@ -905,7 +985,7 @@ def make_excel_output(
                 "normality_alpha", "max_outliers_per_group", "gcrit_mode",
                 "manual_gcrit", "gcrit_alpha", "gcrit_tail", "mad_zcrit",
                 "robust_interval_z", "bootstrap_ci", "n_boot", "random_seed",
-                "devices", "analytes", "conditions",
+                "devices", "analytes", "conditions", "global_flag_column", "treat_all_global_flag_as_false",
             ],
             "value": [
                 cfg.device_mode, cfg.outlier_method, auto_note,
@@ -915,6 +995,7 @@ def make_excel_output(
                 ", ".join(map(str, cfg.devices)),
                 ", ".join(cfg.analytes),
                 "; ".join([f"{k}: {','.join(v)}" for k, v in cfg.condition_map.items()]),
+                cfg.global_flag_col if cfg.global_flag_col else "None", cfg.treat_all_global_false,
             ],
         })
         settings.to_excel(writer, sheet_name="settings", index=False)
@@ -1016,6 +1097,24 @@ with c2:
 with c3:
     device_col = st.selectbox("Device ID column", options=cols, index=cols.index(device_guess))
 
+flag_options = ["None"] + cols
+global_guess = guess_col(cols, "global_flag") if "global_flag" in ID_GUESSES else ("global_flag" if "global_flag" in cols else None)
+if global_guess is None:
+    lower_cols = {c.lower(): c for c in cols}
+    global_guess = lower_cols.get("global_flag")
+fc1, fc2 = st.columns([2, 3])
+with fc1:
+    global_flag_col = st.selectbox(
+        "Global flag column",
+        options=flag_options,
+        index=flag_options.index(global_guess) if global_guess in flag_options else 0,
+    )
+with fc2:
+    treat_all_global_false = st.checkbox(
+        "Treat all rows as global_flag = FALSE when no flag column is selected",
+        value=False,
+    )
+
 working_preview = df.copy()
 working_preview["_sample_number"] = working_preview[sample_col].apply(extract_sample_number).astype(str)
 working_preview["_device"] = working_preview[device_col].astype(str)
@@ -1037,7 +1136,7 @@ st.subheader("3) Define conditions")
 condition_mode = st.radio(
     "How should conditions be defined?",
     options=["Manual: assign sample numbers to conditions", "Use an existing condition/level column"],
-    index=0 if condition_guess is None else 1,
+    index=0,
 )
 
 condition_map: Dict[str, List[str]] = {}
@@ -1053,18 +1152,18 @@ if condition_mode == "Use an existing condition/level column":
     for cond in chosen_conditions:
         condition_map[str(cond)] = sorted(temp.loc[temp[cond_col].astype(str) == str(cond), "_sample_number"].astype(str).unique().tolist())
 else:
-    n_conditions = st.number_input("Number of conditions", min_value=1, max_value=20, value=4, step=1)
-    default_names = ["Anemic", "Normal", "Low WBC", "Low PLT"]
+    n_conditions = st.number_input("Number of conditions", min_value=1, max_value=20, value=1, step=1)
+    default_names = [""]
     used_samples = set()
     for i in range(int(n_conditions)):
         cols_condition = st.columns([1, 3])
         with cols_condition[0]:
-            default_name = default_names[i] if i < len(default_names) else f"Condition {i+1}"
+            default_name = default_names[i] if i < len(default_names) else ""
             cond_name = st.text_input(f"Condition {i+1} name", value=default_name, key=f"cond_name_{i}")
         with cols_condition[1]:
             remaining_default = [s for s in all_samples if s not in used_samples]
             selected = st.multiselect(
-                f"Sample numbers for {cond_name}",
+                f"Sample numbers for {cond_name.strip() or f'Condition {i+1}'}",
                 options=all_samples,
                 default=[],
                 key=f"cond_samples_{i}",
@@ -1135,7 +1234,7 @@ c1, c2, c3, c4 = st.columns(4)
 with c1:
     max_outliers_per_group = st.selectbox("Max outliers to remove per condition/device/sample/analyte", [0, 1, 2], index=1)
 with c2:
-    gcrit_mode = st.selectbox("Gcrit mode", ["Manual Gcrit value", "Automatic from n, alpha, and tail"], index=0)
+    gcrit_mode = st.selectbox("Gcrit mode", ["Manual Gcrit value", "Automatic from n, alpha, and tail"], index=1)
 with c3:
     gcrit = st.number_input("Manual Gcrit value", min_value=0.0, value=3.135, step=0.001, format="%.3f")
 with c4:
@@ -1175,6 +1274,8 @@ if run:
         batch_col=batch_col,
         sample_col=sample_col,
         device_col=device_col,
+        global_flag_col=None if global_flag_col == "None" else global_flag_col,
+        treat_all_global_false=bool(treat_all_global_false),
         condition_map=condition_map,
         analytes=analytes,
         devices=devices,
@@ -1192,8 +1293,13 @@ if run:
         random_seed=int(random_seed),
     )
 
-    with st.spinner("Preparing data and applying outlier flags..."):
-        work = make_long_working_df(df, cfg)
+    if (not cfg.treat_all_global_false) and (not cfg.global_flag_col):
+        st.error("Select a Global flag column, or tick the option to treat all rows as global_flag = FALSE.")
+        st.stop()
+
+    with st.spinner("Preparing data, excluding global_flag=TRUE rows, and applying statistical outlier flags..."):
+        eligible_df, global_flag_log = split_global_flag_rows(df, cfg)
+        work = make_long_working_df(eligible_df, cfg)
         flagged, outlier_log, outlier_decisions = apply_outlier_flags(work, cfg)
 
     if work.empty:
@@ -1220,6 +1326,12 @@ if run:
     else:
         st.dataframe(outlier_log, use_container_width=True)
 
+    st.markdown("### global_flag=TRUE exclusions")
+    if global_flag_log.empty:
+        st.info("No rows were excluded by global_flag, or all rows were explicitly treated as global_flag = FALSE.")
+    else:
+        st.dataframe(global_flag_log, use_container_width=True)
+
     st.markdown("### Quick interpretation")
     st.markdown(
         """
@@ -1234,7 +1346,7 @@ if run:
     )
 
     st.markdown("### Download")
-    excel_bytes = make_excel_output(final_summary, outlier_log, cfg, outlier_decisions)
+    excel_bytes = make_excel_output(final_summary, outlier_log, cfg, outlier_decisions, global_flag_log)
     st.download_button(
         label="Download combined Excel results",
         data=excel_bytes,
