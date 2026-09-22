@@ -46,6 +46,9 @@ class AnalysisConfig:
     global_flag_col: Optional[str]
     treat_all_global_false: bool
     condition_map: Dict[str, List[str]]
+    condition_mode: str
+    condition_col: Optional[str]
+    source_condition_col: Optional[str]
     analytes: List[str]
     devices: List[str]
     device_mode: str
@@ -86,6 +89,80 @@ def extract_sample_number(x) -> str:
     if m:
         return str(m.group(1))
     return s
+
+
+def normalize_condition_label(x) -> str:
+    """Normalize common condition labels without changing displayed names."""
+    if pd.isna(x):
+        return ""
+    text = re.sub(r"[^a-z0-9]+", " ", str(x).strip().lower()).strip()
+    aliases = {
+        "anaemic": "anemic",
+        "low platelet": "low plt",
+        "low platelets": "low plt",
+        "low platelet count": "low plt",
+        "low white blood cell": "low wbc",
+        "low white blood cells": "low wbc",
+        "low white cell": "low wbc",
+    }
+    return aliases.get(text, text)
+
+
+def assign_analysis_conditions(df: pd.DataFrame, cfg: AnalysisConfig) -> pd.Series:
+    """Assign exactly one analysis condition to each row.
+
+    Existing-column mode always uses the row's source condition directly.
+
+    Manual mode remains available for standalone files.  When a combined file
+    contains a source condition/level column, manual sample mapping is ALSO
+    constrained by that source condition whenever possible.  This is critical
+    because sample numbers such as IS-17 or IS-23 can legitimately recur in
+    more than one study condition.  If a custom manual condition cannot be
+    resolved to one source condition, the app stops instead of silently pooling
+    rows across conditions.
+    """
+    sample_numbers = df[cfg.sample_col].apply(extract_sample_number).astype(str)
+    assigned = pd.Series(np.nan, index=df.index, dtype=object)
+
+    # Direct source-column mode: source condition is authoritative.
+    if cfg.condition_mode.startswith("Use an existing") and cfg.condition_col and cfg.condition_col in df.columns:
+        key_lookup = {normalize_condition_label(k): k for k in cfg.condition_map.keys()}
+        source_norm = df[cfg.condition_col].map(normalize_condition_label)
+        assigned = source_norm.map(key_lookup)
+        return assigned
+
+    source_col = cfg.source_condition_col if (cfg.source_condition_col and cfg.source_condition_col in df.columns) else None
+    source_norm = df[source_col].map(normalize_condition_label) if source_col else None
+    source_values = set(source_norm.dropna().astype(str).tolist()) if source_col else set()
+
+    for condition, sample_list in cfg.condition_map.items():
+        samples = {str(x) for x in sample_list}
+        mask = sample_numbers.isin(samples)
+
+        if source_col:
+            cond_norm = normalize_condition_label(condition)
+            if cond_norm in source_values:
+                # Typical combined-file case: "Low PLT" maps only to rows whose
+                # actual Condition is Low PLT, even if the same IS number exists
+                # in Normal/Anemic/Low WBC.
+                mask = mask & source_norm.eq(cond_norm)
+            else:
+                observed = sorted({x for x in source_norm.loc[mask].dropna().astype(str).tolist() if x})
+                if len(observed) == 1:
+                    mask = mask & source_norm.eq(observed[0])
+                elif len(observed) > 1:
+                    pretty = ", ".join(observed)
+                    raise ValueError(
+                        f"Manual condition '{condition}' includes sample numbers that occur in multiple "
+                        f"source conditions ({pretty}). Rename the manual condition to the matching source "
+                        f"condition, or use 'Use an existing condition/level column'."
+                    )
+
+        if assigned.loc[mask].notna().any():
+            raise ValueError("At least one row was assigned to more than one analysis condition.")
+        assigned.loc[mask] = condition
+
+    return assigned
 
 
 def coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
@@ -247,26 +324,36 @@ def normalize_bool(value) -> bool:
 
 
 def split_global_flag_rows(df: pd.DataFrame, cfg: AnalysisConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Exclude global_flag=TRUE before statistical analysis and retain a separate audit."""
+    """Exclude global_flag=TRUE before statistical analysis and retain a separate audit.
+
+    Condition assignment is resolved on the FULL uploaded dataset before the
+    flag split.  This prevents manual sample mappings from being inferred from a
+    partial subset and guarantees the same condition membership in raw and
+    standalone-file workflows.
+    """
+    tagged = df.copy()
+    tagged["_analysis_condition"] = assign_analysis_conditions(tagged, cfg)
+
     if cfg.treat_all_global_false or not cfg.global_flag_col or cfg.global_flag_col == "None":
-        return df.copy(), pd.DataFrame()
-    if cfg.global_flag_col not in df.columns:
+        return tagged.copy(), pd.DataFrame()
+    if cfg.global_flag_col not in tagged.columns:
         raise ValueError(f"Selected global flag column '{cfg.global_flag_col}' was not found.")
 
-    mask = df[cfg.global_flag_col].map(normalize_bool).fillna(False).astype(bool)
-    excluded = df.loc[mask].copy()
-    eligible = df.loc[~mask].copy()
-
-    sample_to_condition = {}
-    for condition, sample_list in cfg.condition_map.items():
-        for sample in sample_list:
-            sample_to_condition[str(sample)] = condition
+    mask = tagged[cfg.global_flag_col].map(normalize_bool).fillna(False).astype(bool)
+    excluded = tagged.loc[mask].copy()
+    eligible = tagged.loc[~mask].copy()
 
     rows = []
+    selected_devices = {str(d) for d in cfg.devices}
     for _, row in excluded.iterrows():
-        sample_number = str(extract_sample_number(row.get(cfg.sample_col, "")))
-        condition = sample_to_condition.get(sample_number, "")
+        condition = row.get("_analysis_condition", np.nan)
+        if pd.isna(condition):
+            continue
+        condition = str(condition)
         device = str(row.get(cfg.device_col, ""))
+        if device not in selected_devices:
+            continue
+        sample_number = str(extract_sample_number(row.get(cfg.sample_col, "")))
         batch = str(row.get(cfg.batch_col, ""))
         sample_id = row.get(cfg.sample_col, "")
         for analyte in cfg.analytes:
@@ -279,7 +366,7 @@ def split_global_flag_rows(df: pd.DataFrame, cfg: AnalysisConfig) -> Tuple[pd.Da
                 "analyte": analyte,
                 "batch_id": batch,
                 "bloodSampleId": sample_id,
-                "deviceId": device,
+                "deviceId": row.get(cfg.device_col, ""),
                 "value": row.get(analyte, np.nan),
                 "normality_status_raw": "",
                 "shapiro_wilk_p_residuals_raw": np.nan,
@@ -305,14 +392,16 @@ def make_long_working_df(df: pd.DataFrame, cfg: AnalysisConfig) -> pd.DataFrame:
     work["_device"] = work[cfg.device_col].astype(str)
     work["_batch_id"] = work[cfg.batch_col].astype(str)
 
-    # condition mapping from selected sample numbers
-    sample_to_condition = {}
-    for condition, sample_list in cfg.condition_map.items():
-        for s in sample_list:
-            sample_to_condition[str(s)] = condition
-    work["_condition"] = work["_sample_number"].map(sample_to_condition)
-
+    # Use the condition assignment resolved on the full uploaded dataset when
+    # available; otherwise resolve it here.  Manual mappings on combined files
+    # are source-condition-aware, so repeated IS numbers cannot pull rows from
+    # unrelated study conditions.
+    if "_analysis_condition" in work.columns:
+        work["_condition"] = work["_analysis_condition"]
+    else:
+        work["_condition"] = assign_analysis_conditions(work, cfg)
     work = work[work["_condition"].notna()].copy()
+
     work = work[work["_device"].isin([str(d) for d in cfg.devices])].copy()
     work = coerce_numeric(work, cfg.analytes)
     return work
@@ -934,17 +1023,117 @@ def build_final_summary(
     return pd.DataFrame(out_rows)
 
 
+def summarize_per_sample_cv(
+    work_flagged: pd.DataFrame,
+    cfg: AnalysisConfig,
+    decisions: pd.DataFrame,
+    cleaned: bool,
+) -> pd.DataFrame:
+    """One repeatability CV per condition x sample x analyte, pooled across selected devices.
+
+    The sample is fixed, so replicate cells are the selected devices. The same
+    outlier flags already used by the main analysis are respected.
+    """
+    if work_flagged is None or work_flagged.empty:
+        return pd.DataFrame()
+
+    decision_lookup = {}
+    if decisions is not None and not decisions.empty:
+        for _, r in decisions.iterrows():
+            decision_lookup[(str(r["condition"]), str(r["analyte"]))] = r.to_dict()
+
+    rows = []
+    dataset = "cleaned_outliers_removed" if cleaned else "raw_no_outlier_removal"
+    for condition in cfg.condition_map.keys():
+        cdf0 = work_flagged[work_flagged["_condition"].astype(str) == str(condition)].copy()
+        if cdf0.empty:
+            continue
+        for analyte in cfg.analytes:
+            flag_col = f"_outlier_{analyte}"
+            for sample_number, sdf0 in cdf0.groupby("_sample_number", dropna=False):
+                sdf = sdf0.copy()
+                if cleaned and flag_col in sdf.columns:
+                    sdf = sdf[~sdf[flag_col]].copy()
+                stats_dict = pooled_repeatability_stats(sdf, analyte, ["_device"])
+                if int(stats_dict.get("n_rows", 0)) == 0:
+                    continue
+                dec = decision_lookup.get((str(condition), str(analyte)), {})
+                method = dec.get("outlier_method_selected", cfg.outlier_method)
+                if str(method).startswith("Gcrit"):
+                    center_name = "mean"; center_value = stats_dict.get("mean", np.nan)
+                    cv_name = "CV%"; cv_value = stats_dict.get("cv_repeat_pct", np.nan)
+                elif method == "None":
+                    diag = diagnostic_tests(sdf, analyte, ["_device"], ["_device"])
+                    p = diag.get("shapiro_wilk_p_residuals", np.nan)
+                    if np.isfinite(p) and p >= 0.05:
+                        center_name = "mean"; center_value = stats_dict.get("mean", np.nan)
+                        cv_name = "CV%"; cv_value = stats_dict.get("cv_repeat_pct", np.nan)
+                    else:
+                        center_name = "median"; center_value = stats_dict.get("median", np.nan)
+                        cv_name = "Robust CV% (MAD)"; cv_value = stats_dict.get("robust_cv_mad_pct", np.nan)
+                else:
+                    center_name = "median"; center_value = stats_dict.get("median", np.nan)
+                    cv_name = "Robust CV% (MAD)"; cv_value = stats_dict.get("robust_cv_mad_pct", np.nan)
+
+                sample_ids = sdf[cfg.sample_col].dropna().astype(str).unique().tolist() if cfg.sample_col in sdf.columns else []
+                rows.append({
+                    "dataset": dataset,
+                    "condition": str(condition),
+                    "sample_number": str(sample_number),
+                    "bloodSampleId": sample_ids[0] if len(sample_ids) == 1 else "; ".join(sample_ids),
+                    "analyte": analyte,
+                    "scope": "sample_pooled_selected_devices",
+                    "n_rows": stats_dict.get("n_rows", np.nan),
+                    "n_cells": stats_dict.get("n_cells", np.nan),
+                    "center_statistic": center_name,
+                    "center_value": center_value,
+                    "sd_repeat": stats_dict.get("sd_repeat", np.nan),
+                    "cv_statistic": cv_name,
+                    "cv_pct": cv_value,
+                    "standard_cv_pct": stats_dict.get("cv_repeat_pct", np.nan),
+                    "robust_cv_mad_pct": stats_dict.get("robust_cv_mad_pct", np.nan),
+                    "outlier_method_selected": method,
+                })
+    return pd.DataFrame(rows)
+
+
+def build_counts_audit(final_summary: pd.DataFrame) -> pd.DataFrame:
+    """Side-by-side valid analyte row/cell counts before and after statistical outlier removal."""
+    if final_summary is None or final_summary.empty:
+        return pd.DataFrame(columns=[
+            "condition", "analyte", "device", "raw_n_rows", "raw_n_cells",
+            "clean_n_rows", "clean_n_cells", "n_rows_removed", "n_cells_removed"
+        ])
+    keys = ["condition", "analyte", "device"]
+    raw = final_summary[final_summary["dataset"] == "raw_no_outlier_removal"][keys + ["n_rows", "n_cells"]].copy()
+    clean = final_summary[final_summary["dataset"] == "cleaned_outliers_removed"][keys + ["n_rows", "n_cells"]].copy()
+    raw = raw.rename(columns={"n_rows": "raw_n_rows", "n_cells": "raw_n_cells"})
+    clean = clean.rename(columns={"n_rows": "clean_n_rows", "n_cells": "clean_n_cells"})
+    out = raw.merge(clean, on=keys, how="outer")
+    out["n_rows_removed"] = pd.to_numeric(out["raw_n_rows"], errors="coerce") - pd.to_numeric(out["clean_n_rows"], errors="coerce")
+    out["n_cells_removed"] = pd.to_numeric(out["raw_n_cells"], errors="coerce") - pd.to_numeric(out["clean_n_cells"], errors="coerce")
+    return out.sort_values(keys).reset_index(drop=True)
+
+
 def make_excel_output(
     final_summary: pd.DataFrame,
     outlier_log: pd.DataFrame,
     cfg: AnalysisConfig,
     decisions: pd.DataFrame,
     global_flag_log: pd.DataFrame,
+    per_sample_summary: Optional[pd.DataFrame] = None,
+    counts_audit: Optional[pd.DataFrame] = None,
 ) -> bytes:
     """Return ONE combined Excel workbook with separate statistical-outlier and global-flag audits."""
     excel_buf = io.BytesIO()
     with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
         final_summary.to_excel(writer, sheet_name="summary_raw_cleaned", index=False)
+        (per_sample_summary if per_sample_summary is not None else pd.DataFrame()).to_excel(
+            writer, sheet_name="per_sample_CV", index=False
+        )
+        (counts_audit if counts_audit is not None else pd.DataFrame()).to_excel(
+            writer, sheet_name="row_cell_counts", index=False
+        )
 
         if outlier_log.empty:
             outlier_cols = [
@@ -985,7 +1174,7 @@ def make_excel_output(
                 "normality_alpha", "max_outliers_per_group", "gcrit_mode",
                 "manual_gcrit", "gcrit_alpha", "gcrit_tail", "mad_zcrit",
                 "robust_interval_z", "bootstrap_ci", "n_boot", "random_seed",
-                "devices", "analytes", "conditions", "global_flag_column", "treat_all_global_flag_as_false",
+                "devices", "analytes", "conditions", "condition_source_column", "global_flag_column", "treat_all_global_flag_as_false",
             ],
             "value": [
                 cfg.device_mode, cfg.outlier_method, auto_note,
@@ -995,6 +1184,7 @@ def make_excel_output(
                 ", ".join(map(str, cfg.devices)),
                 ", ".join(cfg.analytes),
                 "; ".join([f"{k}: {','.join(v)}" for k, v in cfg.condition_map.items()]),
+                cfg.condition_col if cfg.condition_col else "Manual sample mapping",
                 cfg.global_flag_col if cfg.global_flag_col else "None", cfg.treat_all_global_false,
             ],
         })
@@ -1133,19 +1323,31 @@ rep_table = pd.crosstab(working_preview["_sample_number"], working_preview["_dev
 st.dataframe(rep_table, use_container_width=True)
 
 st.subheader("3) Define conditions")
+st.caption("If the uploaded file contains multiple study conditions, use its condition/level column. Rows are then filtered by that column directly, so repeated sample numbers in different conditions cannot be remapped or overcounted.")
 condition_mode = st.radio(
     "How should conditions be defined?",
     options=["Manual: assign sample numbers to conditions", "Use an existing condition/level column"],
-    index=0,
+    index=1 if condition_guess is not None else 0,
 )
+if condition_mode.startswith("Manual") and condition_guess is not None:
+    st.caption(
+        f"Safety rule: this combined file contains '{condition_guess}'. Manual sample mappings are also "
+        "restricted to the matching source condition when possible; ambiguous cross-condition mappings are blocked."
+    )
 
 condition_map: Dict[str, List[str]] = {}
+condition_col: Optional[str] = None
+# Retain the detected source condition column even in manual mode so manual
+# sample selection can be safely scoped within the true study condition.
+source_condition_col: Optional[str] = condition_guess if condition_guess in cols else None
 all_samples = sorted(working_preview["_sample_number"].dropna().astype(str).unique().tolist())
 
 if condition_mode == "Use an existing condition/level column":
     if condition_guess is None:
         condition_guess = cols[0]
     cond_col = st.selectbox("Condition column", options=cols, index=cols.index(condition_guess))
+    condition_col = cond_col
+    source_condition_col = cond_col
     temp = working_preview[[cond_col, "_sample_number"]].dropna()
     observed_conditions = sorted(temp[cond_col].astype(str).unique().tolist())
     chosen_conditions = st.multiselect("Conditions to analyze", observed_conditions, default=observed_conditions)
@@ -1174,6 +1376,12 @@ else:
 
 # Show condition map
 condition_map = {k: v for k, v in condition_map.items() if len(v) > 0}
+if condition_col is None:
+    assigned = [s for vals in condition_map.values() for s in vals]
+    dupes = sorted({s for s in assigned if assigned.count(s) > 1})
+    if dupes:
+        st.error("A sample number was assigned to more than one manual condition: " + ", ".join(dupes) + ". Use the existing condition/level column when sample numbers overlap across conditions.")
+        st.stop()
 if len(condition_map) == 0:
     st.warning("Assign at least one sample number to at least one condition.")
     st.stop()
@@ -1277,6 +1485,9 @@ if run:
         global_flag_col=None if global_flag_col == "None" else global_flag_col,
         treat_all_global_false=bool(treat_all_global_false),
         condition_map=condition_map,
+        condition_mode=condition_mode,
+        condition_col=condition_col,
+        source_condition_col=source_condition_col,
         analytes=analytes,
         devices=devices,
         device_mode=device_mode,
@@ -1297,10 +1508,14 @@ if run:
         st.error("Select a Global flag column, or tick the option to treat all rows as global_flag = FALSE.")
         st.stop()
 
-    with st.spinner("Preparing data, excluding global_flag=TRUE rows, and applying statistical outlier flags..."):
-        eligible_df, global_flag_log = split_global_flag_rows(df, cfg)
-        work = make_long_working_df(eligible_df, cfg)
-        flagged, outlier_log, outlier_decisions = apply_outlier_flags(work, cfg)
+    try:
+        with st.spinner("Preparing data, excluding global_flag=TRUE rows, and applying statistical outlier flags..."):
+            eligible_df, global_flag_log = split_global_flag_rows(df, cfg)
+            work = make_long_working_df(eligible_df, cfg)
+            flagged, outlier_log, outlier_decisions = apply_outlier_flags(work, cfg)
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
 
     if work.empty:
         st.error("No rows remained after condition/device selection. Check your sample-condition mapping and selected devices.")
@@ -1313,12 +1528,25 @@ if run:
     raw_final = build_final_summary(raw_summary, raw_diag, outlier_decisions, cfg)
     clean_final = build_final_summary(clean_summary, clean_diag, outlier_decisions, cfg)
     final_summary = pd.concat([raw_final, clean_final], ignore_index=True)
+    per_sample_summary = pd.concat([
+        summarize_per_sample_cv(flagged, cfg, outlier_decisions, cleaned=False),
+        summarize_per_sample_cv(flagged, cfg, outlier_decisions, cleaned=True),
+    ], ignore_index=True)
+    counts_audit = build_counts_audit(final_summary)
 
     st.success("Analysis complete.")
 
     st.markdown("### Summary: raw and automatically cleaned")
     st.caption("The workbook reports one center and one CV only: mean + CV for Gcrit, median + robust MAD CV for robust-MAD cleaning.")
     st.dataframe(final_summary, use_container_width=True)
+
+    st.markdown("### Row/cell counts before and after outlier removal")
+    st.caption("n_rows = valid analyte observations after global-flag/design filtering; n_cells = distinct repeatability cells (sample × device for pooled results).")
+    st.dataframe(counts_audit, use_container_width=True, hide_index=True)
+
+    st.markdown("### Per-sample repeatability CV")
+    st.caption("One CV per condition × sample × analyte, pooling within-device replicate scatter across the selected devices. This does not replace the condition-level pooled CV.")
+    st.dataframe(per_sample_summary, use_container_width=True, hide_index=True)
 
     st.markdown("### Outliers removed log")
     if outlier_log.empty:
@@ -1346,7 +1574,10 @@ if run:
     )
 
     st.markdown("### Download")
-    excel_bytes = make_excel_output(final_summary, outlier_log, cfg, outlier_decisions, global_flag_log)
+    excel_bytes = make_excel_output(
+        final_summary, outlier_log, cfg, outlier_decisions, global_flag_log,
+        per_sample_summary=per_sample_summary, counts_audit=counts_audit,
+    )
     st.download_button(
         label="Download combined Excel results",
         data=excel_bytes,
