@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 import streamlit as st
+from validation_io import ANALYTE_ORDER, default_analytes as detect_default_analytes, canonical_rows, read_input, finite_numeric
 
 
 # ============================================================
@@ -28,10 +29,7 @@ ID_GUESSES = {
 
 # Requested Streamlit default ordering. Only columns actually present in the
 # uploaded file are selected, but they appear in this order.
-DEFAULT_ANALYTE_ORDER = [
-    "RBC", "WBC_2", "PLT", "HCT", "HGB", "MCV", "RDW", "MCH", "MCHC",
-    "NEUT_2", "LYMPH_2", "MXD_2", "PLT_3", "MCV_3", "RDW_3",
-]
+DEFAULT_ANALYTE_ORDER = ANALYTE_ORDER
 
 AUTO_OUTLIER_METHOD = "Automatic: Shapiro-Wilk -> Gcrit if normal, Robust MAD if non-normal"
 GCRIT_OUTLIER_METHOD = "Gcrit Grubbs-like: remove largest |value-mean|/SD if >= Gcrit"
@@ -168,7 +166,7 @@ def assign_analysis_conditions(df: pd.DataFrame, cfg: AnalysisConfig) -> pd.Seri
 def coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     out = df.copy()
     for c in cols:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
+        out[c] = finite_numeric(out[c])
     return out
 
 
@@ -331,7 +329,7 @@ def split_global_flag_rows(df: pd.DataFrame, cfg: AnalysisConfig) -> Tuple[pd.Da
     partial subset and guarantees the same condition membership in raw and
     standalone-file workflows.
     """
-    tagged = df.copy()
+    tagged = canonical_rows(df)
     tagged["_analysis_condition"] = assign_analysis_conditions(tagged, cfg)
 
     if cfg.treat_all_global_false or not cfg.global_flag_col or cfg.global_flag_col == "None":
@@ -387,7 +385,10 @@ def split_global_flag_rows(df: pd.DataFrame, cfg: AnalysisConfig) -> Tuple[pd.Da
 
 
 def make_long_working_df(df: pd.DataFrame, cfg: AnalysisConfig) -> pd.DataFrame:
-    work = df.copy()
+    work = canonical_rows(df)
+    if work[cfg.sample_col].isna().any() or work[cfg.device_col].isna().any():
+        raise ValueError("Sample and device identifiers must be present on every row.")
+    work["_sample_key"] = work[cfg.sample_col].astype(str).str.strip()
     work["_sample_number"] = work[cfg.sample_col].apply(extract_sample_number).astype(str)
     work["_device"] = work[cfg.device_col].astype(str)
     work["_batch_id"] = work[cfg.batch_col].astype(str)
@@ -438,7 +439,7 @@ def build_outlier_decisions(work: pd.DataFrame, cfg: AnalysisConfig) -> pd.DataF
         for analyte in cfg.analytes:
             diag = diagnostic_tests(
                 cdf, analyte,
-                ["_sample_number", "_device"],
+                ["_sample_key", "_device"],
                 ["_device"],
             )
             p = diag.get("shapiro_wilk_p_residuals", np.nan)
@@ -483,7 +484,7 @@ def apply_outlier_flags(work: pd.DataFrame, cfg: AnalysisConfig) -> Tuple[pd.Dat
         flag_col = f"_outlier_{analyte}"
         df[flag_col] = False
 
-        group_cols = ["_condition", "_device", "_sample_number"]
+        group_cols = ["_condition", "_device", "_sample_key"]
         for keys, sub in df.groupby(group_cols, dropna=False):
             condition, device, sample_number = keys
             decision = decision_lookup.get((str(condition), str(analyte), str(device)), {})
@@ -553,7 +554,7 @@ def pooled_repeatability_stats(
 
     group_cols define replicate cells:
         per-device analysis: ["_sample_number"]
-        pooled-all-devices analysis: ["_sample_number", "_device"]
+        pooled-all-devices analysis: ["_sample_key", "_device"]
     """
     ydf = df[group_cols + [analyte]].copy()
     ydf[analyte] = pd.to_numeric(ydf[analyte], errors="coerce")
@@ -776,11 +777,11 @@ def summarize_analysis(work_flagged: pd.DataFrame, cfg: AnalysisConfig, cleaned:
                 # Per device
                 for device in sorted(cdf["_device"].dropna().astype(str).unique()):
                     ddf = cdf[cdf["_device"].astype(str) == str(device)].copy()
-                    stats_dict = pooled_repeatability_stats(ddf, analyte, ["_sample_number"])
-                    diag = diagnostic_tests(ddf, analyte, ["_sample_number"], ["_sample_number"])
+                    stats_dict = pooled_repeatability_stats(ddf, analyte, ["_sample_key"])
+                    diag = diagnostic_tests(ddf, analyte, ["_sample_key"], ["_sample_key"])
                     ci = {}
                     if cfg.make_bootstrap_ci:
-                        ci = bootstrap_ci_repeatability(ddf, analyte, ["_sample_number"], cfg.n_boot, cfg.random_seed)
+                        ci = bootstrap_ci_repeatability(ddf, analyte, ["_sample_key"], cfg.n_boot, cfg.random_seed)
 
                     rows.append({
                         "dataset": "cleaned_outliers_removed" if cleaned else "raw_no_outlier_removal",
@@ -802,11 +803,11 @@ def summarize_analysis(work_flagged: pd.DataFrame, cfg: AnalysisConfig, cleaned:
                     })
 
             # Pooled across all devices
-            stats_dict = pooled_repeatability_stats(cdf, analyte, ["_sample_number", "_device"])
-            diag = diagnostic_tests(cdf, analyte, ["_sample_number", "_device"], ["_device"])
+            stats_dict = pooled_repeatability_stats(cdf, analyte, ["_sample_key", "_device"])
+            diag = diagnostic_tests(cdf, analyte, ["_sample_key", "_device"], ["_device"])
             ci = {}
             if cfg.make_bootstrap_ci:
-                ci = bootstrap_ci_repeatability(cdf, analyte, ["_sample_number", "_device"], cfg.n_boot, cfg.random_seed)
+                ci = bootstrap_ci_repeatability(cdf, analyte, ["_sample_key", "_device"], cfg.n_boot, cfg.random_seed)
 
             pooled_stats_dict = stats_dict.copy()
             pooled_ci = ci.copy()
@@ -1001,6 +1002,9 @@ def build_final_summary(
             "center_value": center_value,
             "cv_statistic": cv_name,
             "cv_pct": cv_value,
+            "standard_cv_pct": r.get("cv_repeat_pct", np.nan),
+            "robust_cv_mad_pct": r.get("robust_cv_mad_pct", np.nan),
+            "reported_sd": r.get("sd_repeat" if cv_name == "CV%" else "robust_sd_mad", np.nan),
             "normality_pass_p_ge_0_05": selection_pass,
             "shapiro_wilk_p_residuals": selection_p,
             "levene_mean_p": r.get("levene_mean_p", np.nan),
@@ -1050,7 +1054,8 @@ def summarize_per_sample_cv(
             continue
         for analyte in cfg.analytes:
             flag_col = f"_outlier_{analyte}"
-            for sample_number, sdf0 in cdf0.groupby("_sample_number", dropna=False):
+            for sample_key, sdf0 in cdf0.groupby("_sample_key", dropna=False):
+                sample_number = extract_sample_number(sample_key)
                 sdf = sdf0.copy()
                 if cleaned and flag_col in sdf.columns:
                     sdf = sdf[~sdf[flag_col]].copy()
@@ -1090,6 +1095,9 @@ def summarize_per_sample_cv(
                     "sd_repeat": stats_dict.get("sd_repeat", np.nan),
                     "cv_statistic": cv_name,
                     "cv_pct": cv_value,
+                    "mean": stats_dict.get("mean", np.nan),
+                    "median": stats_dict.get("median", np.nan),
+                    "robust_sd_mad": stats_dict.get("robust_sd_mad", np.nan),
                     "standard_cv_pct": stats_dict.get("cv_repeat_pct", np.nan),
                     "robust_cv_mad_pct": stats_dict.get("robust_cv_mad_pct", np.nan),
                     "outlier_method_selected": method,
@@ -1229,359 +1237,373 @@ def make_excel_output(
 # Streamlit UI
 # ============================================================
 
-st.set_page_config(page_title="Imprecision Short Repeatability App", layout="wide")
-st.title("Imprecision Short Repeatability App")
-st.caption("Upload Excel/CSV → detect samples/devices → define conditions → choose analytes → repeatability SD/CV per device and pooled across devices.")
+def run_analysis(df, cfg):
+    eligible, qc = split_global_flag_rows(df, cfg)
+    work = make_long_working_df(eligible, cfg)
+    flagged, outliers, decisions = apply_outlier_flags(work, cfg)
+    summaries, samples = [], []
+    for cleaned in [False, True]:
+        summary, diagnostics = summarize_analysis(flagged, cfg, cleaned)
+        summaries.append(build_final_summary(summary, diagnostics, decisions, cfg))
+        samples.append(summarize_per_sample_cv(flagged, cfg, decisions, cleaned))
+    final = pd.concat(summaries, ignore_index=True)
+    return {"summary": final, "per_sample": pd.concat(samples, ignore_index=True),
+            "outliers": outliers, "decisions": decisions, "qc": qc,
+            "counts": build_counts_audit(final), "flagged": flagged}
 
-with st.expander("What this app calculates", expanded=False):
-    st.markdown(
-        r"""
-**Repeatability per device** is calculated from replicate scatter within each selected sample on the same device.
 
-For each condition × analyte × device:
+def main():
+    st.set_page_config(page_title="Imprecision Short Repeatability App", layout="wide")
+    st.title("Imprecision Short Repeatability App")
+    st.caption("Upload Excel/CSV → detect samples/devices → define conditions → choose analytes → repeatability SD/CV per device and pooled across devices.")
 
-\[
-SD_{repeat} = \\sqrt{\\frac{\\sum_s\\sum_r(y_{sr}-\\bar{y}_s)^2}{\\sum_s(n_s-1)}}
-\]
+    with st.expander("What this app calculates", expanded=False):
+        st.markdown(
+            r"""
+    **Repeatability per device** is calculated from replicate scatter within each selected sample on the same device.
 
-\[
-CV_{repeat}\\% = 100 \\times \\frac{SD_{repeat}}{\\bar{y}}
-\]
+    For each condition × analyte × device:
 
-**Pooled across devices** uses the same formula but treats each sample × device as a replicate cell.
+    \[
+    SD_{repeat} = \\sqrt{\\frac{\\sum_s\\sum_r(y_{sr}-\\bar{y}_s)^2}{\\sum_s(n_s-1)}}
+    \]
 
-The app reports raw results and cleaned results after optional outlier removal.
-"""
-    )
+    \[
+    CV_{repeat}\\% = 100 \\times \\frac{SD_{repeat}}{\\bar{y}}
+    \]
 
-uploaded = st.file_uploader("Upload Excel or CSV", type=["xlsx", "xls", "csv"])
-if uploaded is None:
-    st.info("Upload a file to begin.")
-    st.stop()
+    **Pooled across devices** uses the same formula but treats each sample × device as a replicate cell.
 
-try:
-    if uploaded.name.lower().endswith(".csv"):
-        df = pd.read_csv(uploaded)
-    else:
-        df = pd.read_excel(uploaded, engine="openpyxl")
-except Exception as e:
-    st.error(f"Could not read file: {e}")
-    st.stop()
+    The app reports raw results and cleaned results after optional outlier removal.
+    """
+        )
 
-st.subheader("1) Preview uploaded data")
-st.write(f"Rows: **{df.shape[0]}** | Columns: **{df.shape[1]}**")
-st.dataframe(df.head(25), use_container_width=True)
-
-cols = list(df.columns)
-batch_guess = guess_col(cols, "batch") or cols[0]
-sample_guess = guess_col(cols, "sample") or cols[0]
-device_guess = guess_col(cols, "device") or cols[0]
-condition_guess = guess_col(cols, "condition")
-
-st.subheader("2) Confirm ID columns")
-c1, c2, c3 = st.columns(3)
-with c1:
-    batch_col = st.selectbox("Batch ID column", options=cols, index=cols.index(batch_guess))
-with c2:
-    sample_col = st.selectbox("Blood sample ID column", options=cols, index=cols.index(sample_guess))
-with c3:
-    device_col = st.selectbox("Device ID column", options=cols, index=cols.index(device_guess))
-
-flag_options = ["None"] + cols
-global_guess = guess_col(cols, "global_flag") if "global_flag" in ID_GUESSES else ("global_flag" if "global_flag" in cols else None)
-if global_guess is None:
-    lower_cols = {c.lower(): c for c in cols}
-    global_guess = lower_cols.get("global_flag")
-fc1, fc2 = st.columns([2, 3])
-with fc1:
-    global_flag_col = st.selectbox(
-        "Global flag column",
-        options=flag_options,
-        index=flag_options.index(global_guess) if global_guess in flag_options else 0,
-    )
-with fc2:
-    treat_all_global_false = st.checkbox(
-        "Treat all rows as global_flag = FALSE when no flag column is selected",
-        value=False,
-    )
-
-working_preview = df.copy()
-working_preview["_sample_number"] = working_preview[sample_col].apply(extract_sample_number).astype(str)
-working_preview["_device"] = working_preview[device_col].astype(str)
-
-st.markdown("**Detected sample numbers from bloodSampleId after `IS-`:**")
-sample_counts = (
-    working_preview.groupby("_sample_number")
-    .agg(n_rows=(batch_col, "size"), devices=("_device", lambda x: ", ".join(sorted(x.astype(str).unique()))))
-    .reset_index()
-    .sort_values("_sample_number")
-)
-st.dataframe(sample_counts, use_container_width=True)
-
-st.markdown("**Replicate counts by sample × device:**")
-rep_table = pd.crosstab(working_preview["_sample_number"], working_preview["_device"])
-st.dataframe(rep_table, use_container_width=True)
-
-st.subheader("3) Define conditions")
-st.caption("If the uploaded file contains multiple study conditions, use its condition/level column. Rows are then filtered by that column directly, so repeated sample numbers in different conditions cannot be remapped or overcounted.")
-condition_mode = st.radio(
-    "How should conditions be defined?",
-    options=["Manual: assign sample numbers to conditions", "Use an existing condition/level column"],
-    index=1 if condition_guess is not None else 0,
-)
-if condition_mode.startswith("Manual") and condition_guess is not None:
-    st.caption(
-        f"Safety rule: this combined file contains '{condition_guess}'. Manual sample mappings are also "
-        "restricted to the matching source condition when possible; ambiguous cross-condition mappings are blocked."
-    )
-
-condition_map: Dict[str, List[str]] = {}
-condition_col: Optional[str] = None
-# Retain the detected source condition column even in manual mode so manual
-# sample selection can be safely scoped within the true study condition.
-source_condition_col: Optional[str] = condition_guess if condition_guess in cols else None
-all_samples = sorted(working_preview["_sample_number"].dropna().astype(str).unique().tolist())
-
-if condition_mode == "Use an existing condition/level column":
-    if condition_guess is None:
-        condition_guess = cols[0]
-    cond_col = st.selectbox("Condition column", options=cols, index=cols.index(condition_guess))
-    condition_col = cond_col
-    source_condition_col = cond_col
-    temp = working_preview[[cond_col, "_sample_number"]].dropna()
-    observed_conditions = sorted(temp[cond_col].astype(str).unique().tolist())
-    chosen_conditions = st.multiselect("Conditions to analyze", observed_conditions, default=observed_conditions)
-    for cond in chosen_conditions:
-        condition_map[str(cond)] = sorted(temp.loc[temp[cond_col].astype(str) == str(cond), "_sample_number"].astype(str).unique().tolist())
-else:
-    n_conditions = st.number_input("Number of conditions", min_value=1, max_value=20, value=1, step=1)
-    default_names = [""]
-    used_samples = set()
-    for i in range(int(n_conditions)):
-        cols_condition = st.columns([1, 3])
-        with cols_condition[0]:
-            default_name = default_names[i] if i < len(default_names) else ""
-            cond_name = st.text_input(f"Condition {i+1} name", value=default_name, key=f"cond_name_{i}")
-        with cols_condition[1]:
-            remaining_default = [s for s in all_samples if s not in used_samples]
-            selected = st.multiselect(
-                f"Sample numbers for {cond_name.strip() or f'Condition {i+1}'}",
-                options=all_samples,
-                default=[],
-                key=f"cond_samples_{i}",
-            )
-        if cond_name.strip():
-            condition_map[cond_name.strip()] = [str(s) for s in selected]
-            used_samples.update(selected)
-
-# Show condition map
-condition_map = {k: v for k, v in condition_map.items() if len(v) > 0}
-if condition_col is None:
-    assigned = [s for vals in condition_map.values() for s in vals]
-    dupes = sorted({s for s in assigned if assigned.count(s) > 1})
-    if dupes:
-        st.error("A sample number was assigned to more than one manual condition: " + ", ".join(dupes) + ". Use the existing condition/level column when sample numbers overlap across conditions.")
-        st.stop()
-if len(condition_map) == 0:
-    st.warning("Assign at least one sample number to at least one condition.")
-    st.stop()
-
-st.markdown("**Condition/sample mapping to be analyzed:**")
-mapping_rows = []
-for cond, samples in condition_map.items():
-    mapping_rows.append({"condition": cond, "n_samples": len(samples), "samples": ", ".join(samples)})
-st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True)
-
-st.subheader("4) Select devices and analytes")
-
-devices_all = sorted(working_preview["_device"].dropna().astype(str).unique().tolist())
-# Default: devices with decent row counts
-device_counts = working_preview["_device"].value_counts()
-default_devices = [str(d) for d in device_counts[device_counts >= max(3, int(0.05 * len(working_preview)))].index.tolist()]
-default_devices = sorted(default_devices) if len(default_devices) else devices_all
-
-device_mode = st.selectbox("Device handling", ["Pool all devices", "Analyze each device separately + pooled"], index=0)
-devices = st.multiselect("Devices to include", options=devices_all, default=default_devices)
-
-reserved = {batch_col, sample_col, device_col, "_sample_number", "_device"}
-numeric_candidates = []
-for c in cols:
-    if c in reserved:
-        continue
-    as_num = pd.to_numeric(df[c], errors="coerce")
-    if as_num.notna().sum() >= max(3, int(0.1 * len(df))):
-        numeric_candidates.append(c)
-
-# Put the requested analytes first in both the selector and the selected tags.
-# Requested default analytes are kept even when they are sparse and therefore
-# would not pass the generic >=10% numeric-candidate threshold above.
-requested_present = [a for a in DEFAULT_ANALYTE_ORDER if a in cols]
-ordered_first = requested_present
-numeric_candidates = ordered_first + [c for c in numeric_candidates if c not in ordered_first]
-default_analytes = ordered_first.copy()
-if not default_analytes:
-    default_analytes = numeric_candidates[:8]
-
-analytes = st.multiselect("Analyte columns to analyze", options=numeric_candidates, default=default_analytes)
-
-st.subheader("5) Outliers and confidence intervals")
-outlier_method = st.selectbox(
-    "Outlier detection method",
-    options=[
-        AUTO_OUTLIER_METHOD,
-        "None",
-        GCRIT_OUTLIER_METHOD,
-        MAD_OUTLIER_METHOD,
-        "95% robust interval: remove most extreme outside median ± z*MAD_SD",
-    ],
-    index=0,
-    help="Automatic mode uses raw Shapiro-Wilk residual normality to choose the existing Gcrit or Robust MAD rule.",
-)
-
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    max_outliers_per_group = st.selectbox("Max outliers to remove per condition/device/sample/analyte", [0, 1, 2], index=1)
-with c2:
-    gcrit_mode = st.selectbox("Gcrit mode", ["Manual Gcrit value", "Automatic from n, alpha, and tail"], index=1)
-with c3:
-    gcrit = st.number_input("Manual Gcrit value", min_value=0.0, value=3.135, step=0.001, format="%.3f")
-with c4:
-    gcrit_alpha = st.number_input("Automatic Gcrit alpha", min_value=0.0001, max_value=0.2, value=0.01, step=0.001, format="%.4f")
-
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    gcrit_tail = st.selectbox("Automatic Gcrit tail", ["Two-sided", "One-sided"], index=0)
-with c2:
-    mad_zcrit = st.number_input("MAD modified-z threshold", min_value=0.1, value=3.5, step=0.1, format="%.1f")
-with c3:
-    robust_interval_z = st.number_input("Robust interval z", min_value=0.5, value=1.96, step=0.01)
-with c4:
-    make_bootstrap_ci = st.checkbox("Report 95% bootstrap CIs", value=False)
-
-n_boot = st.slider("Bootstrap resamples", min_value=100, max_value=20000, value=2000, step=100, disabled=not make_bootstrap_ci)
-random_seed = st.number_input("Random seed", min_value=0, value=42, step=1)
-
-st.markdown("""
-**Outlier outputs:** raw results are always reported; cleaned results remove flagged outliers using the selected rule.  
-**Automatic mode:** for each condition × analyte, Shapiro-Wilk is evaluated on raw pooled sample × device residuals across the selected devices. Normal data (`p ≥ 0.05`) use the existing Gcrit rule; non-normal data (`p < 0.05`) use the existing Robust MAD rule. The chosen rule is then applied consistently to that analyte on every selected device. If Shapiro-Wilk cannot be evaluated, Robust MAD is used as a conservative fallback.  
-**Gcrit automatic mode:** recalculates Grubbs' critical value from the current replicate-cell size `n`, alpha, and one-/two-sided setting during sequential removal.
-""")
-
-st.subheader("6) Run")
-run = st.button("Run imprecision short analysis", type="primary")
-
-if run:
-    if len(devices) == 0:
-        st.error("Select at least one device.")
-        st.stop()
-    if len(analytes) == 0:
-        st.error("Select at least one analyte.")
-        st.stop()
-
-    cfg = AnalysisConfig(
-        batch_col=batch_col,
-        sample_col=sample_col,
-        device_col=device_col,
-        global_flag_col=None if global_flag_col == "None" else global_flag_col,
-        treat_all_global_false=bool(treat_all_global_false),
-        condition_map=condition_map,
-        condition_mode=condition_mode,
-        condition_col=condition_col,
-        source_condition_col=source_condition_col,
-        analytes=analytes,
-        devices=devices,
-        device_mode=device_mode,
-        outlier_method=outlier_method,
-        max_outliers_per_group=int(max_outliers_per_group),
-        gcrit_mode=gcrit_mode,
-        gcrit=float(gcrit),
-        gcrit_alpha=float(gcrit_alpha),
-        gcrit_tail=gcrit_tail,
-        mad_zcrit=float(mad_zcrit),
-        robust_interval_z=float(robust_interval_z),
-        make_bootstrap_ci=bool(make_bootstrap_ci),
-        n_boot=int(n_boot),
-        random_seed=int(random_seed),
-    )
-
-    if (not cfg.treat_all_global_false) and (not cfg.global_flag_col):
-        st.error("Select a Global flag column, or tick the option to treat all rows as global_flag = FALSE.")
+    uploaded = st.file_uploader("Upload Excel or CSV", type=["xlsx", "csv"])
+    if uploaded is None:
+        st.info("Upload a file to begin.")
         st.stop()
 
     try:
-        with st.spinner("Preparing data, excluding global_flag=TRUE rows, and applying statistical outlier flags..."):
-            eligible_df, global_flag_log = split_global_flag_rows(df, cfg)
-            work = make_long_working_df(eligible_df, cfg)
-            flagged, outlier_log, outlier_decisions = apply_outlier_flags(work, cfg)
-    except ValueError as e:
-        st.error(str(e))
+        df = read_input(uploaded)
+    except Exception as e:
+        st.error(f"Could not read file: {e}")
         st.stop()
 
-    if work.empty:
-        st.error("No rows remained after condition/device selection. Check your sample-condition mapping and selected devices.")
+    st.subheader("1) Preview uploaded data")
+    st.write(f"Rows: **{df.shape[0]}** | Columns: **{df.shape[1]}**")
+    st.dataframe(df.head(25), use_container_width=True)
+
+    cols = list(df.columns)
+    batch_guess = guess_col(cols, "batch") or cols[0]
+    sample_guess = guess_col(cols, "sample") or cols[0]
+    device_guess = guess_col(cols, "device") or cols[0]
+    condition_guess = guess_col(cols, "condition")
+
+    st.subheader("2) Confirm ID columns")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        batch_col = st.selectbox("Batch ID column", options=cols, index=cols.index(batch_guess))
+    with c2:
+        sample_col = st.selectbox("Blood sample ID column", options=cols, index=cols.index(sample_guess))
+    with c3:
+        device_col = st.selectbox("Device ID column", options=cols, index=cols.index(device_guess))
+
+    flag_options = ["None"] + cols
+    global_guess = guess_col(cols, "global_flag") if "global_flag" in ID_GUESSES else ("global_flag" if "global_flag" in cols else None)
+    if global_guess is None:
+        lower_cols = {c.lower(): c for c in cols}
+        global_guess = lower_cols.get("global_flag")
+    fc1, fc2 = st.columns([2, 3])
+    with fc1:
+        global_flag_col = st.selectbox(
+            "Global flag column",
+            options=flag_options,
+            index=flag_options.index(global_guess) if global_guess in flag_options else 0,
+        )
+    with fc2:
+        treat_all_global_false = st.checkbox(
+            "Treat all rows as global_flag = FALSE when no flag column is selected",
+            value=False,
+        )
+
+    working_preview = df.copy()
+    working_preview["_sample_number"] = working_preview[sample_col].apply(extract_sample_number).astype(str)
+    working_preview["_device"] = working_preview[device_col].astype(str)
+
+    st.markdown("**Detected sample numbers from bloodSampleId after `IS-`:**")
+    sample_counts = (
+        working_preview.groupby("_sample_number")
+        .agg(n_rows=(batch_col, "size"), devices=("_device", lambda x: ", ".join(sorted(x.astype(str).unique()))))
+        .reset_index()
+        .sort_values("_sample_number")
+    )
+    st.dataframe(sample_counts, use_container_width=True)
+
+    st.markdown("**Replicate counts by sample × device:**")
+    rep_table = pd.crosstab(working_preview["_sample_number"], working_preview["_device"])
+    st.dataframe(rep_table, use_container_width=True)
+
+    st.subheader("3) Define conditions")
+    st.caption("If the uploaded file contains multiple study conditions, use its condition/level column. Rows are then filtered by that column directly, so repeated sample numbers in different conditions cannot be remapped or overcounted.")
+    condition_mode = st.radio(
+        "How should conditions be defined?",
+        options=["Manual: assign sample numbers to conditions", "Use an existing condition/level column"],
+        index=1 if condition_guess is not None else 0,
+    )
+    if condition_mode.startswith("Manual") and condition_guess is not None:
+        st.caption(
+            f"Safety rule: this combined file contains '{condition_guess}'. Manual sample mappings are also "
+            "restricted to the matching source condition when possible; ambiguous cross-condition mappings are blocked."
+        )
+
+    condition_map: Dict[str, List[str]] = {}
+    condition_col: Optional[str] = None
+    # Retain the detected source condition column even in manual mode so manual
+    # sample selection can be safely scoped within the true study condition.
+    source_condition_col: Optional[str] = condition_guess if condition_guess in cols else None
+    all_samples = sorted(working_preview["_sample_number"].dropna().astype(str).unique().tolist())
+
+    if condition_mode == "Use an existing condition/level column":
+        if condition_guess is None:
+            condition_guess = cols[0]
+        cond_col = st.selectbox("Condition column", options=cols, index=cols.index(condition_guess))
+        condition_col = cond_col
+        source_condition_col = cond_col
+        temp = working_preview[[cond_col, "_sample_number"]].dropna()
+        observed_conditions = sorted(temp[cond_col].astype(str).unique().tolist())
+        chosen_conditions = st.multiselect("Conditions to analyze", observed_conditions, default=observed_conditions)
+        for cond in chosen_conditions:
+            condition_map[str(cond)] = sorted(temp.loc[temp[cond_col].astype(str) == str(cond), "_sample_number"].astype(str).unique().tolist())
+    else:
+        n_conditions = st.number_input("Number of conditions", min_value=1, max_value=20, value=1, step=1)
+        default_names = ["Condition 1"]
+        used_samples = set()
+        for i in range(int(n_conditions)):
+            cols_condition = st.columns([1, 3])
+            with cols_condition[0]:
+                default_name = default_names[i] if i < len(default_names) else ""
+                cond_name = st.text_input(f"Condition {i+1} name", value=default_name, key=f"cond_name_{i}")
+            with cols_condition[1]:
+                remaining_default = [s for s in all_samples if s not in used_samples]
+                selected = st.multiselect(
+                    f"Sample numbers for {cond_name.strip() or f'Condition {i+1}'}",
+                    options=all_samples,
+                    default=all_samples if int(n_conditions) == 1 else [],
+                    key=f"cond_samples_{i}",
+                )
+            if cond_name.strip():
+                condition_map[cond_name.strip()] = [str(s) for s in selected]
+                used_samples.update(selected)
+
+    # Show condition map
+    condition_map = {k: v for k, v in condition_map.items() if len(v) > 0}
+    if condition_col is None:
+        assigned = [s for vals in condition_map.values() for s in vals]
+        dupes = sorted({s for s in assigned if assigned.count(s) > 1})
+        if dupes:
+            st.error("A sample number was assigned to more than one manual condition: " + ", ".join(dupes) + ". Use the existing condition/level column when sample numbers overlap across conditions.")
+            st.stop()
+    if len(condition_map) == 0:
+        st.warning("Assign at least one sample number to at least one condition.")
         st.stop()
 
-    with st.spinner("Computing repeatability summaries, diagnostics, and bootstrap CIs..."):
-        raw_summary, raw_diag = summarize_analysis(flagged, cfg, cleaned=False)
-        clean_summary, clean_diag = summarize_analysis(flagged, cfg, cleaned=True)
+    st.markdown("**Condition/sample mapping to be analyzed:**")
+    mapping_rows = []
+    for cond, samples in condition_map.items():
+        mapping_rows.append({"condition": cond, "n_samples": len(samples), "samples": ", ".join(samples)})
+    st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True)
 
-    raw_final = build_final_summary(raw_summary, raw_diag, outlier_decisions, cfg)
-    clean_final = build_final_summary(clean_summary, clean_diag, outlier_decisions, cfg)
-    final_summary = pd.concat([raw_final, clean_final], ignore_index=True)
-    per_sample_summary = pd.concat([
-        summarize_per_sample_cv(flagged, cfg, outlier_decisions, cleaned=False),
-        summarize_per_sample_cv(flagged, cfg, outlier_decisions, cleaned=True),
-    ], ignore_index=True)
-    counts_audit = build_counts_audit(final_summary)
+    st.subheader("4) Select devices and analytes")
 
-    st.success("Analysis complete.")
+    devices_all = sorted(working_preview["_device"].dropna().astype(str).unique().tolist())
+    default_devices = devices_all
 
-    st.markdown("### Summary: raw and automatically cleaned")
-    st.caption("The workbook reports one center and one CV only: mean + CV for Gcrit, median + robust MAD CV for robust-MAD cleaning.")
-    st.dataframe(final_summary, use_container_width=True)
+    device_mode = st.selectbox("Device handling", ["Pool all devices", "Analyze each device separately + pooled"], index=0)
+    devices = st.multiselect("Devices to include", options=devices_all, default=default_devices)
 
-    st.markdown("### Row/cell counts before and after outlier removal")
-    st.caption("n_rows = valid analyte observations after global-flag/design filtering; n_cells = distinct repeatability cells (sample × device for pooled results).")
-    st.dataframe(counts_audit, use_container_width=True, hide_index=True)
+    reserved = {batch_col, sample_col, device_col, "_sample_number", "_device"}
+    numeric_candidates = []
+    for c in cols:
+        if c in reserved:
+            continue
+        as_num = pd.to_numeric(df[c], errors="coerce")
+        if as_num.notna().sum() >= max(3, int(0.1 * len(df))):
+            numeric_candidates.append(c)
 
-    st.markdown("### Per-sample repeatability CV")
-    st.caption("One CV per condition × sample × analyte, pooling within-device replicate scatter across the selected devices. This does not replace the condition-level pooled CV.")
-    st.dataframe(per_sample_summary, use_container_width=True, hide_index=True)
+    # Put the requested analytes first in both the selector and the selected tags.
+    # Requested default analytes are kept even when they are sparse and therefore
+    # would not pass the generic >=10% numeric-candidate threshold above.
+    requested_present = detect_default_analytes(cols)
+    ordered_first = requested_present
+    numeric_candidates = ordered_first + [c for c in numeric_candidates if c not in ordered_first]
+    default_analytes = ordered_first.copy()
+    if not default_analytes:
+        default_analytes = numeric_candidates[:8]
 
-    st.markdown("### Outliers removed log")
-    if outlier_log.empty:
-        st.info("No outliers were flagged by the selected/automatic method.")
-    else:
-        st.dataframe(outlier_log, use_container_width=True)
+    analytes = st.multiselect("Analyte columns to analyze", options=numeric_candidates, default=default_analytes)
 
-    st.markdown("### global_flag=TRUE exclusions")
-    if global_flag_log.empty:
-        st.info("No rows were excluded by global_flag, or all rows were explicitly treated as global_flag = FALSE.")
-    else:
-        st.dataframe(global_flag_log, use_container_width=True)
-
-    st.markdown("### Quick interpretation")
-    st.markdown(
-        """
-- `raw_no_outlier_removal` = the original selected observations before outlier removal.
-- `cleaned_outliers_removed` = the same analysis after the automatically selected Gcrit/MAD rule removes flagged observations.
-- `distribution` comes from Shapiro-Wilk on within-cell residuals for that displayed dataset.
-- Automatic outlier choice is made once per condition × analyte from **raw pooled sample × device residual normality**: normal → Gcrit; non-normal → Robust MAD.
-- `center_value` is therefore a mean for Gcrit reporting and a median for Robust MAD reporting.
-- `cv_pct` is therefore standard pooled repeatability CV% for Gcrit reporting and robust MAD CV% for Robust MAD reporting.
-- `aggregation_method` retains the existing per-device/pooled calculation definition.
-"""
+    st.subheader("5) Outliers and confidence intervals")
+    outlier_method = st.selectbox(
+        "Outlier detection method",
+        options=[
+            AUTO_OUTLIER_METHOD,
+            "None",
+            GCRIT_OUTLIER_METHOD,
+            MAD_OUTLIER_METHOD,
+            "95% robust interval: remove most extreme outside median ± z*MAD_SD",
+        ],
+        index=0,
+        help="Automatic mode uses raw Shapiro-Wilk residual normality to choose the existing Gcrit or Robust MAD rule.",
     )
 
-    st.markdown("### Download")
-    excel_bytes = make_excel_output(
-        final_summary, outlier_log, cfg, outlier_decisions, global_flag_log,
-        per_sample_summary=per_sample_summary, counts_audit=counts_audit,
-    )
-    st.download_button(
-        label="Download combined Excel results",
-        data=excel_bytes,
-        file_name="imprecision_short_results.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        max_outliers_per_group = st.selectbox("Max outliers to remove per condition/device/sample/analyte", [0, 1, 2], index=1)
+    with c2:
+        gcrit_mode = st.selectbox("Gcrit mode", ["Manual Gcrit value", "Automatic from n, alpha, and tail"], index=1)
+    with c3:
+        gcrit = st.number_input("Manual Gcrit value", min_value=0.0, value=3.135, step=0.001, format="%.3f")
+    with c4:
+        gcrit_alpha = st.number_input("Automatic Gcrit alpha", min_value=0.0001, max_value=0.2, value=0.01, step=0.001, format="%.4f")
 
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        gcrit_tail = st.selectbox("Automatic Gcrit tail", ["Two-sided", "One-sided"], index=0)
+    with c2:
+        mad_zcrit = st.number_input("MAD modified-z threshold", min_value=0.1, value=3.5, step=0.1, format="%.1f")
+    with c3:
+        robust_interval_z = st.number_input("Robust interval z", min_value=0.5, value=1.96, step=0.01)
+    with c4:
+        make_bootstrap_ci = st.checkbox("Report 95% bootstrap CIs", value=False)
+
+    n_boot = st.slider("Bootstrap resamples", min_value=100, max_value=20000, value=2000, step=100, disabled=not make_bootstrap_ci)
+    random_seed = st.number_input("Random seed", min_value=0, value=42, step=1)
+
+    st.markdown("""
+    **Outlier outputs:** raw results are always reported; cleaned results remove flagged outliers using the selected rule.  
+    **Automatic mode:** for each condition × analyte, Shapiro-Wilk is evaluated on raw pooled sample × device residuals across the selected devices. Normal data (`p ≥ 0.05`) use the existing Gcrit rule; non-normal data (`p < 0.05`) use the existing Robust MAD rule. The chosen rule is then applied consistently to that analyte on every selected device. If Shapiro-Wilk cannot be evaluated, Robust MAD is used as a conservative fallback.  
+    **Gcrit automatic mode:** recalculates Grubbs' critical value from the current replicate-cell size `n`, alpha, and one-/two-sided setting during sequential removal.
+    """)
+
+    st.subheader("6) Run")
+    run = st.button("Run imprecision short analysis", type="primary")
+
+    if run:
+        if len(devices) == 0:
+            st.error("Select at least one device.")
+            st.stop()
+        if len(analytes) == 0:
+            st.error("Select at least one analyte.")
+            st.stop()
+
+        cfg = AnalysisConfig(
+            batch_col=batch_col,
+            sample_col=sample_col,
+            device_col=device_col,
+            global_flag_col=None if global_flag_col == "None" else global_flag_col,
+            treat_all_global_false=bool(treat_all_global_false),
+            condition_map=condition_map,
+            condition_mode=condition_mode,
+            condition_col=condition_col,
+            source_condition_col=source_condition_col,
+            analytes=analytes,
+            devices=devices,
+            device_mode=device_mode,
+            outlier_method=outlier_method,
+            max_outliers_per_group=int(max_outliers_per_group),
+            gcrit_mode=gcrit_mode,
+            gcrit=float(gcrit),
+            gcrit_alpha=float(gcrit_alpha),
+            gcrit_tail=gcrit_tail,
+            mad_zcrit=float(mad_zcrit),
+            robust_interval_z=float(robust_interval_z),
+            make_bootstrap_ci=bool(make_bootstrap_ci),
+            n_boot=int(n_boot),
+            random_seed=int(random_seed),
+        )
+
+        if (not cfg.treat_all_global_false) and (not cfg.global_flag_col):
+            st.error("Select a Global flag column, or tick the option to treat all rows as global_flag = FALSE.")
+            st.stop()
+
+        try:
+            with st.spinner("Preparing data, excluding global_flag=TRUE rows, and applying statistical outlier flags..."):
+                eligible_df, global_flag_log = split_global_flag_rows(df, cfg)
+                work = make_long_working_df(eligible_df, cfg)
+                flagged, outlier_log, outlier_decisions = apply_outlier_flags(work, cfg)
+        except ValueError as e:
+            st.error(str(e))
+            st.stop()
+
+        if work.empty:
+            st.error("No rows remained after condition/device selection. Check your sample-condition mapping and selected devices.")
+            st.stop()
+
+        with st.spinner("Computing repeatability summaries, diagnostics, and bootstrap CIs..."):
+            raw_summary, raw_diag = summarize_analysis(flagged, cfg, cleaned=False)
+            clean_summary, clean_diag = summarize_analysis(flagged, cfg, cleaned=True)
+
+        raw_final = build_final_summary(raw_summary, raw_diag, outlier_decisions, cfg)
+        clean_final = build_final_summary(clean_summary, clean_diag, outlier_decisions, cfg)
+        final_summary = pd.concat([raw_final, clean_final], ignore_index=True)
+        per_sample_summary = pd.concat([
+            summarize_per_sample_cv(flagged, cfg, outlier_decisions, cleaned=False),
+            summarize_per_sample_cv(flagged, cfg, outlier_decisions, cleaned=True),
+        ], ignore_index=True)
+        counts_audit = build_counts_audit(final_summary)
+
+        st.success("Analysis complete.")
+
+        st.markdown("### Summary: raw and automatically cleaned")
+        st.caption("The workbook reports one center and one CV only: mean + CV for Gcrit, median + robust MAD CV for robust-MAD cleaning.")
+        st.dataframe(final_summary, use_container_width=True)
+
+        st.markdown("### Row/cell counts before and after outlier removal")
+        st.caption("n_rows = valid analyte observations after global-flag/design filtering; n_cells = distinct repeatability cells (sample × device for pooled results).")
+        st.dataframe(counts_audit, use_container_width=True, hide_index=True)
+
+        st.markdown("### Per-sample repeatability CV")
+        st.caption("One CV per condition × sample × analyte, pooling within-device replicate scatter across the selected devices. This does not replace the condition-level pooled CV.")
+        st.dataframe(per_sample_summary, use_container_width=True, hide_index=True)
+
+        st.markdown("### Outliers removed log")
+        if outlier_log.empty:
+            st.info("No outliers were flagged by the selected/automatic method.")
+        else:
+            st.dataframe(outlier_log, use_container_width=True)
+
+        st.markdown("### global_flag=TRUE exclusions")
+        if global_flag_log.empty:
+            st.info("No rows were excluded by global_flag, or all rows were explicitly treated as global_flag = FALSE.")
+        else:
+            st.dataframe(global_flag_log, use_container_width=True)
+
+        st.markdown("### Quick interpretation")
+        st.markdown(
+            """
+    - `raw_no_outlier_removal` = the original selected observations before outlier removal.
+    - `cleaned_outliers_removed` = the same analysis after the automatically selected Gcrit/MAD rule removes flagged observations.
+    - `distribution` comes from Shapiro-Wilk on within-cell residuals for the raw pooled condition/analyte selection dataset.
+    - Automatic outlier choice is made once per condition × analyte from **raw pooled sample × device residual normality**: normal → Gcrit; non-normal → Robust MAD.
+    - `center_value` is therefore a mean for Gcrit reporting and a median for Robust MAD reporting.
+    - `cv_pct` is therefore standard pooled repeatability CV% for Gcrit reporting and robust MAD CV% for Robust MAD reporting.
+    - `aggregation_method` retains the existing per-device/pooled calculation definition.
+    """
+        )
+
+        st.markdown("### Download")
+        excel_bytes = make_excel_output(
+            final_summary, outlier_log, cfg, outlier_decisions, global_flag_log,
+            per_sample_summary=per_sample_summary, counts_audit=counts_audit,
+        )
+        st.download_button(
+            label="Download combined Excel results",
+            data=excel_bytes,
+            file_name="imprecision_short_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+
+if __name__ == "__main__":
+    main()
