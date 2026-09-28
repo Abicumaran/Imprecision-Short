@@ -12,12 +12,6 @@ https://imprecision-short.streamlit.app/
    path to **app.py**. Select **Python 3.12** under Advanced settings for a new app.
 4. Deploy, or reboot the existing Streamlit app after committing both files.
 
-Each app has its own app.py. Use one repository per app, or place each app and
-its requirements.txt together in a separate subfolder and point Streamlit at
-that subfolder's app.py. Do not overwrite one app with another in the same folder.
-
-No validation_io.py or analysis_core.py upload is needed: their code is bundled
-inside app.py. The validated numerical functions are preserved from V7.
 
 ## Run locally
 
