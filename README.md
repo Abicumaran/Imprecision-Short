@@ -1,6 +1,6 @@
-# Proxima Short Term — V9
+# Proxima Short Term — V2
 
-https://imprecision-short.streamlit.app/
+https://imprecision-short2.streamlit.app/
 
 ## Upload to GitHub and run on Streamlit
 
