@@ -11,7 +11,7 @@ from scipy import stats
 import streamlit as st
 
 # Bundled input helpers: no companion Python file is required.
-"""Input and ordering rules shared by the four validated app packages."""
+# Input and ordering rules shared by the four validated app packages.
 from pathlib import Path
 import hashlib
 import io

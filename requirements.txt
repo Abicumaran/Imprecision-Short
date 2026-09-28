@@ -1,5 +1,7 @@
-streamlit==1.64.0
+# Tested runtime target: CPython 3.10-3.13; recommend Python 3.12.
+# Replace the old requirements.txt as well as app.py.
+streamlit==1.45.1
 pandas==2.2.3
-numpy==2.3.5
-scipy==1.17.0
+numpy==2.2.6
+scipy==1.15.3
 openpyxl==3.1.5
